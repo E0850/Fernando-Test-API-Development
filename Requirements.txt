@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pyodbcpyodbc
+psycopg2
