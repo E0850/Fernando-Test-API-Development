@@ -1870,7 +1870,7 @@ def ensure_tables_and_seed_user():
             db.execute(
                 insert(users_table).values(
                     username="bugzy",
-                    hashed_password=get_password_hash("12345678"),
+                    hashed_password=get_password_hash("P@ssw0rd!"),
                     is_active=True,
                     scopes=join_scopes(seed_scopes),
                     token_version=1,
