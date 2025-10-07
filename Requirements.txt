@@ -3,3 +3,4 @@ uvicorn[standard]
 sqlalchemy
 pyodbc
 psycopg2
+python-jose[cryptography]
