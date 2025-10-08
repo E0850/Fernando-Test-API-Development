@@ -5,6 +5,15 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import List, Optional, Dict, Any, Tuple
 
+from passlib.exc import UnknownHashError
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except (UnknownHashError, ValueError):
+        # Treat invalid/unknown hash as bad credentials, not server error
+        return False
+
 from fastapi import (
     FastAPI,
     HTTPException,
