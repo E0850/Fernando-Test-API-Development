@@ -4,25 +4,18 @@ import html
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import List, Optional, Dict, Any, Tuple
-
 from passlib.exc import UnknownHashError
-
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
         return pwd_context.verify(plain_password, hashed_password)
     except (UnknownHashError, ValueError):
         # Treat invalid/unknown hash as bad credentials, not server error
         return False
-
-
 import bcrypt
-
 def get_password_hash(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
-
 from fastapi import (
     FastAPI,
     HTTPException,
@@ -63,20 +56,16 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy.orm import sessionmaker, Session
-
 # Auto-load .env for local/dev runs (safe no-op in prod)
 try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv()
 except Exception:
     pass
-
-
 # ------------------------------------------------------------------------------------
 # FastAPI App
 # ------------------------------------------------------------------------------------
 app = FastAPI(title="Fernando Test API Development")
-
 # CORS (configure via env CORS_ORIGINS="*")
 app.add_middleware(
     CORSMiddleware,
@@ -85,8 +74,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 # ------------------------------------------------------------------------------------
 # Database (Render-friendly env vars + scheme normalization)
 # ------------------------------------------------------------------------------------
@@ -106,14 +93,10 @@ def _resolve_db_url() -> str:
     if raw.startswith("postgres://"):
         raw = raw.replace("postgres://", "postgresql+psycopg2://", 1)
     return raw
-
-
 DB_URL = _resolve_db_url()
 engine = create_engine(DB_URL, future=True, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 metadata = MetaData()
-
-
 # ------------------------------------------------------------------------------------
 # OAuth2 / JWT configuration
 # ------------------------------------------------------------------------------------
@@ -122,28 +105,46 @@ if not SECRET_KEY:
     raise RuntimeError("SECRET_KEY is required.")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
-
 # --- Encryption for credential JSON (NEW) ---
 # CRED_ENC_KEY must be a base64 urlsafe 32-byte key (Fernet)
 # Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 from cryptography.fernet import Fernet  # noqa: E402
-
 CRED_ENC_KEY = os.getenv("CRED_ENC_KEY") or os.getenv("ENCRYPTION_KEY")
 if not CRED_ENC_KEY:
     raise RuntimeError(
         "CRED_ENC_KEY is required for encrypted credential downloads. "
         "Generate with Fernet.generate_key() and set as env var."
     )
-
 # Optional key id (useful when rotating keys)
 CRED_ENC_KID = os.getenv("CRED_ENC_KID", "k1")
-
 _fernet = Fernet(CRED_ENC_KEY.encode() if isinstance(CRED_ENC_KEY, str) else CRED_ENC_KEY)
-
-
 def _enc_value(v: str) -> str:
     return _fernet.encrypt(v.encode("utf-8")).decode("utf-8")
 
+# -------------------- NEW HELPERS (decrypt, token check, list of sensitive keys) --------------------
+def _dec_value(v: str) -> str:
+    """Decrypt a Fernet token string to plaintext. Raises if invalid."""
+    return _fernet.decrypt(v.encode("utf-8")).decode("utf-8")
+
+def _value_is_fernet_token(v: str) -> bool:
+    """Best-effort check: return True if v is a valid Fernet token for our key."""
+    try:
+        _fernet.decrypt(v.encode("utf-8"))
+        return True
+    except Exception:
+        return False
+
+def _decrypt_fields(d: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
+    """Return a copy with any Fernet token values in `fields` decrypted to plaintext."""
+    out = dict(d)
+    for k in fields:
+        val = out.get(k)
+        if isinstance(val, str) and val.strip() and _value_is_fernet_token(val):
+            out[k] = _dec_value(val)
+    return out
+
+SENSITIVE_KEYS = ["ci", "cs", "pu", "ot", "saak", "sask"]
+# ----------------------------------------------------------------------------------------------------
 
 def _encrypt_fields(d: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
     out = dict(d)
@@ -155,27 +156,25 @@ def _encrypt_fields(d: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
         sval = str(val).strip()
         if not sval:
             continue
+        # Prevent double-encryption (saak/sask may be encrypted at rest)
+        if _value_is_fernet_token(sval):
+            continue
         out[k] = _enc_value(sval)
         encd.append(k)
-    meta = out.get("_meta", {})
-    meta.update({"enc": "fernet-v1", "enc_keys": encd, "kid": CRED_ENC_KID})
-    out["_meta"] = meta
+    if encd:
+        meta = out.get("_meta", {})
+        meta.update({"enc": "fernet-v1", "enc_keys": encd, "kid": CRED_ENC_KID})
+        out["_meta"] = meta
     return out
-
-
 # ------------------------------------------------------------------------------------
 # Token Revocation Logic (in-memory per-token + token_version in DB)
 # ------------------------------------------------------------------------------------
 revoked_tokens: Dict[str, datetime] = {}
-
-
 def _cleanup_revoked_tokens(now: Optional[datetime] = None) -> None:
     now = now or datetime.utcnow()
     expired = [tok for tok, exp in revoked_tokens.items() if exp <= now]
     for tok in expired:
         revoked_tokens.pop(tok, None)
-
-
 def revoke_token(token: str):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -184,15 +183,10 @@ def revoke_token(token: str):
             revoked_tokens[token] = datetime.utcfromtimestamp(exp)
     except Exception:
         pass
-
-
 def is_token_revoked(token: str) -> bool:
     _cleanup_revoked_tokens()
     return token in revoked_tokens
-
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 SCOPES: Dict[str, str] = {
     "items:read": "Read items",
     "items:write": "Create/update/delete items",
@@ -202,15 +196,11 @@ SCOPES: Dict[str, str] = {
     "cars:write": "Create/update/delete car_control",
     "admin": "Administrative operations",
 }
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", scopes=SCOPES)
 oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="token", scopes=SCOPES, auto_error=False)
-
 KNOWN_SCOPES = set(SCOPES.keys())
 DEFAULT_USER_SCOPES = os.getenv("DEFAULT_USER_SCOPES", "items:read extras:read cars:read").split()
 OPEN_USER_REGISTRATION = os.getenv("OPEN_USER_REGISTRATION", "true").lower() == "true"
-
-
 # ------------------------------------------------------------------------------------
 # Helpers: scopes & strings
 # ------------------------------------------------------------------------------------
@@ -218,23 +208,15 @@ def normalize_scopes(scopes: Optional[List[str]]) -> List[str]:
     if not scopes:
         return []
     return sorted(set(s for s in scopes if s in KNOWN_SCOPES))
-
-
 def parse_scopes_str(s: Optional[str]) -> List[str]:
     return [x for x in (s or "").split(" ") if x]
-
-
 def join_scopes(scopes: List[str]) -> str:
     return " ".join(sorted(set(scopes)))
-
-
 def parse_scopes_from_form(s: Optional[str]) -> Optional[List[str]]:
     if not s:
         return None
-    parts = re.split(r"[ ,]+", s.strip())
+    parts = re.split(r"[\s,]+", s.strip())
     return [p for p in parts if p]
-
-
 def _strip_str_values(d: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in d.items():
@@ -242,15 +224,11 @@ def _strip_str_values(d: Dict[str, Any]) -> Dict[str, Any]:
             v = v.strip()
         out[k] = v
     return out
-
-
 # ------------------------------------------------------------------------------------
 # Helpers: parsing textboxes (all inputs are strings in Swagger)
 # ------------------------------------------------------------------------------------
 def _is_blank(x: Optional[str]) -> bool:
     return x is None or (isinstance(x, str) and x.strip() == "")
-
-
 def as_int(name: str, value: Optional[str], *, required: bool = False) -> Optional[int]:
     if _is_blank(value):
         if required:
@@ -260,8 +238,6 @@ def as_int(name: str, value: Optional[str], *, required: bool = False) -> Option
         return int(value) if value is not None else None
     except Exception:
         raise HTTPException(status_code=422, detail=f"{name} must be an integer")
-
-
 def as_float(name: str, value: Optional[str], *, required: bool = False) -> Optional[float]:
     if _is_blank(value):
         if required:
@@ -271,8 +247,6 @@ def as_float(name: str, value: Optional[str], *, required: bool = False) -> Opti
         return float(value) if value is not None else None
     except Exception:
         raise HTTPException(status_code=422, detail=f"{name} must be a number")
-
-
 def as_bool(name: str, value: Optional[str], default: Optional[bool] = None) -> Optional[bool]:
     if _is_blank(value):
         return default
@@ -282,12 +256,8 @@ def as_bool(name: str, value: Optional[str], default: Optional[bool] = None) -> 
     if v in ("0", "false", "f", "no", "n", "off"):
         return False
     raise HTTPException(status_code=422, detail=f"{name} must be a boolean (true/false)")
-
-
 def as_str_or_none(value: Optional[str]) -> Optional[str]:
     return None if _is_blank(value) else value
-
-
 # ------------------------------------------------------------------------------------
 # Pydantic Response Schemas
 # ------------------------------------------------------------------------------------
@@ -296,8 +266,6 @@ class Item(BaseModel):
     name: str
     description: str
     price: float
-
-
 class Extra(BaseModel):
     extras_code: Optional[str] = None
     name: Optional[str] = None
@@ -319,8 +287,6 @@ class Extra(BaseModel):
     inventory_by_subextra: Optional[int] = None
     sub_extra_lastno: Optional[int] = None
     flat_amount_yn: Optional[str] = None
-
-
 class CarControl(BaseModel):
     unit_no: Optional[str] = None
     license_no: Optional[str] = None
@@ -378,7 +344,6 @@ class CarControl(BaseModel):
     mark_preready_stat: Optional[str] = None
     yard_no: Optional[int] = None
     awxx_last_update_date: Optional[str] = None
-
     class Config:
         schema_extra = {
             "example": {
@@ -440,8 +405,6 @@ class CarControl(BaseModel):
                 "awxx_last_update_date": "2025-10-02T07:00:00Z",
             }
         }
-
-
 def to_item(row: Dict[str, Any]) -> Item:
     price = row["price"]
     if isinstance(price, Decimal):
@@ -452,21 +415,15 @@ def to_item(row: Dict[str, Any]) -> Item:
         description=row["description"],
         price=price,
     )
-
-
 def to_extra(row: Dict[str, Any]) -> Extra:
     r = {k: (v.strip() if isinstance(v, str) else v) for k, v in dict(row).items()}
     if "vat" in r and isinstance(r["vat"], Decimal):
         r["vat"] = float(r["vat"])
     return Extra(**r)
-
-
 def to_car_control(row: Dict[str, Any]) -> CarControl:
     # Trim trailing spaces from all string fields before returning
     r = {k: (v.rstrip() if isinstance(v, str) else v) for k, v in dict(row).items()}
     return CarControl(**r)
-
-
 # ------------------------------------------------------------------------------------
 # SQLAlchemy Core Table Definitions
 # ------------------------------------------------------------------------------------
@@ -478,7 +435,6 @@ items_table = Table(
     Column("description", String, nullable=False),
     Column("price", Numeric(18, 2), nullable=False),
 )
-
 extras_table = Table(
     "extras",
     metadata,
@@ -503,7 +459,6 @@ extras_table = Table(
     Column("sub_extra_lastno", Integer),
     Column("flat_amount_yn", String(1)),
 )
-
 car_control_table = Table(
     "car_control",
     metadata,
@@ -564,7 +519,6 @@ car_control_table = Table(
     Column("yard_no", Integer, nullable=True),
     Column("awxx_last_update_date", String(20), nullable=True),
 )
-
 users_table = Table(
     "users",
     metadata,
@@ -578,8 +532,6 @@ users_table = Table(
     Column("saak", String, nullable=True),
     Column("sask", String, nullable=True),
 )
-
-
 # ------------------------------------------------------------------------------------
 # DB Session Dependency
 # ------------------------------------------------------------------------------------
@@ -589,26 +541,18 @@ def get_db() -> Session:
         yield db
     finally:
         db.close()
-
-
 # ------------------------------------------------------------------------------------
 # Auth Helpers
 # ------------------------------------------------------------------------------------
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
-
-
 def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
-
-
 def get_user_by_username(db: Session, username: str) -> Optional[Dict[str, Any]]:
     row = db.execute(
         select(users_table).where(users_table.c.username == username)
     ).mappings().first()
     return dict(row) if row else None
-
-
 def authenticate_user(db: Session, username: str, password: str) -> Optional[Dict[str, Any]]:
     user = get_user_by_username(db, username)
     if not user:
@@ -618,20 +562,14 @@ def authenticate_user(db: Session, username: str, password: str) -> Optional[Dic
     if not user.get("is_active", True):
         return None
     return user
-
-
 def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-
 class User(BaseModel):
     username: str
     is_active: bool = True
-
-
 def get_current_user(
     security_scopes: SecurityScopes,
     token: str = Depends(oauth2_scheme),
@@ -676,16 +614,12 @@ def get_current_user(
         return User(username=user_record["username"], is_active=user_record.get("is_active", True))
     except JWTError:
         raise credentials_exception
-
-
 def get_current_active_user(
     current_user: User = Security(get_current_user, scopes=[]),
 ) -> User:
     if not current_user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
-
-
 def require_admin_if_closed(token: Optional[str], db: Session) -> None:
     if OPEN_USER_REGISTRATION:
         return
@@ -719,8 +653,6 @@ def require_admin_if_closed(token: Optional[str], db: Session) -> None:
             detail="Invalid token",
             headers={"WWW-Authenticate": auth_header},
         )
-
-
 # ------------------------------------------------------------------------------------
 # Helper Functions (ordering & filters)
 # ------------------------------------------------------------------------------------
@@ -740,14 +672,10 @@ def apply_ordering(query, table, order_by: Optional[str], default_col: str) -> T
         direction = "asc"
     query = query.order_by(col.asc() if direction == "asc" else col.desc())
     return query, f"{col_name}:{direction}"
-
-
 def like_or_equals(col, value: Optional[str], partial: bool):
     if value is None:
         return None
     return col.ilike(f"%{value}%") if partial else (col == value)
-
-
 # ------------------------------------------------------------------------------------
 # Auth: Token endpoint (manual Form fields, blank textboxes)
 # ------------------------------------------------------------------------------------
@@ -775,8 +703,6 @@ def login_for_access_token(
         data={"sub": user["username"], "scopes": granted, "ver": ver}
     )
     return {"access_token": access_token, "token_type": "bearer"}
-
-
 # ------------------------------------------------------------------------------------
 # Users: Register (Form-only), Me, Logout
 # ------------------------------------------------------------------------------------
@@ -785,9 +711,9 @@ def register_user(
     username: str = Form(..., min_length=3, max_length=50, description="Letters, digits, underscore, dot, dash", example=""),
     password: str = Form(..., min_length=8, description="At least 8 characters", example=""),
     scopes_text: Optional[str] = Form("", description="Optional scopes (space/comma separated)", example=""),
-    # NEW: allow setting per-user keys at registration (optional)
-    saak: Optional[str] = Form("", description="User access key (optional)", example=""),
-    sask: Optional[str] = Form("", description="User secret key (optional)", example=""),
+    # NOTE: kept for backward-compat but ignored; we always mirror & encrypt username/password into saak/sask
+    saak: Optional[str] = Form("", description="(Ignored) User access key", example=""),
+    sask: Optional[str] = Form("", description="(Ignored) User secret key", example=""),
     db: Session = Depends(get_db),
     token: Optional[str] = Depends(oauth2_scheme_optional),
 ):
@@ -802,9 +728,12 @@ def register_user(
     ).scalar()
     if exists:
         raise HTTPException(status_code=409, detail="Username already exists")
-
     scopes_in = parse_scopes_from_form(scopes_text)
     scopes = normalize_scopes(scopes_in) if scopes_in is not None else normalize_scopes(DEFAULT_USER_SCOPES)
+
+    # ---- Store encrypted-at-rest mirrors of entered username/password ----
+    enc_saak = _enc_value(username.strip())
+    enc_sask = _enc_value(password.strip())
 
     db.execute(
         insert(users_table).values(
@@ -813,14 +742,12 @@ def register_user(
             is_active=True,
             scopes=join_scopes(scopes),
             token_version=1,
-            saak=as_str_or_none(saak),
-            sask=as_str_or_none(sask),
+            saak=enc_saak,   # encrypted username
+            sask=enc_sask,   # encrypted password
         )
     )
     db.commit()
     return {"username": username, "is_active": True, "scopes": scopes}
-
-
 @app.get("/users/me", response_model=Dict[str, Any], tags=["Users"])
 def read_users_me(
     current_user: User = Security(get_current_user, scopes=[]),
@@ -833,8 +760,6 @@ def read_users_me(
         raise HTTPException(status_code=404, detail="User not found")
     allowed_scopes = normalize_scopes(parse_scopes_str(rec.get("scopes")))
     return {"username": current_user.username, "is_active": current_user.is_active, "scopes": allowed_scopes}
-
-
 @app.post("/logout", tags=["Auth"])
 def logout_current(
     current_user: User = Security(get_current_user, scopes=[]),
@@ -847,8 +772,6 @@ def logout_current(
     )
     db.commit()
     return {"message": "Logged out (all tokens invalidated)"}
-
-
 # ------------------------------------------------------------------------------------
 # Users: manage per-user keys
 # ------------------------------------------------------------------------------------
@@ -873,8 +796,6 @@ def update_my_keys(
         raise HTTPException(status_code=404, detail="User not found")
     db.commit()
     return {"username": current_user.username, "updated": list(vals.keys())}
-
-
 @app.put("/users/{username}/keys", tags=["Users"])
 def update_user_keys(
     username: str = Path(..., description="Target username"),
@@ -895,8 +816,6 @@ def update_user_keys(
         raise HTTPException(status_code=404, detail="User not found")
     db.commit()
     return {"username": username, "updated": list(vals.keys())}
-
-
 # ------------------------------------------------------------------------------------
 # Users: Download Credentials (JSON only, admin-only list)
 # ------------------------------------------------------------------------------------
@@ -953,8 +872,6 @@ def download_user_credentials_json(
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
-
 # ------------------------------------------------------------------------------------
 # Credential Builders & Endpoints (short-key JSON, with encryption and plain toggle)
 # ------------------------------------------------------------------------------------
@@ -968,7 +885,6 @@ def _build_api_for_user(user_record: Dict[str, Any], request: Request) -> Dict[s
     scopes_list = normalize_scopes(parse_scopes_str(user_record.get("scopes")))
     base_url = str(request.base_url).rstrip("/")
     token_full = f"{base_url}/token"
-
     # Prefer per-user values; fallback to env
     tenant_id = os.getenv("TENANT_ID") or "local"
     client_name = os.getenv("CLIENT_NAME") or f"{username}@{tenant_id}"
@@ -978,45 +894,39 @@ def _build_api_for_user(user_record: Dict[str, Any], request: Request) -> Dict[s
     # Per-user keys first
     saak = (user_record.get("saak") or os.getenv("SAAK") or "")
     sask = (user_record.get("sask") or os.getenv("SASK") or "")
-
     payload = {
         "ti": tenant_id,
         "cn": client_name,
-        "dt": "password",   # grant type used by /token in this API
-        "ci": client_id,    # sensitive
+        "dt": "password",  # grant type used by /token in this API
+        "ci": client_id,   # sensitive
         "cs": client_secret,# sensitive
-        "iu": base_url,     # left plaintext by design (visible)
-        "pu": base_url,     # sensitive-ish (encrypt)
-        "oa": token_full,   # left plaintext by design (visible)
-        "ot": "token",      # sensitive-ish (encrypt), no leading slash
+        "iu": base_url,    # left plaintext by design (visible)
+        "pu": base_url,    # sensitive-ish (encrypt)
+        "oa": token_full,  # left plaintext by design (visible)
+        "ot": "token",     # sensitive-ish (encrypt), no leading slash
         "or": "/docs",
         "ev": env_name,
         "v": 1,
-        "saak": saak,       # sensitive
-        "sask": sask,       # sensitive
-
+        "saak": saak,      # sensitive (encrypted-at-rest in DB)
+        "sask": sask,      # sensitive (encrypted-at-rest in DB)
         # Helpful extras (non-canonical)
         "un": username,
         "scopes": scopes_list,
     }
     return payload
-
-
 def _encrypt_payload_if_needed(
     payload: Dict[str, Any],
     *,
     do_encrypt: bool
 ) -> Dict[str, Any]:
     if not do_encrypt:
-        # Ensure no _meta when plaintext is requested
+        # For plaintext exports: strip meta and DECRYPT any encrypted-at-rest sensitive fields
         cp = dict(payload)
         cp.pop("_meta", None)
+        cp = _decrypt_fields(cp, SENSITIVE_KEYS)
         return cp
     # Encrypt only sensitive keys; keep iu/oa visible
-    SENSITIVE = ["ci", "cs", "pu", "ot", "saak", "sask"]
-    return _encrypt_fields(payload, SENSITIVE)
-
-
+    return _encrypt_fields(payload, SENSITIVE_KEYS)
 def _caller_is_admin(db: Session, username: str) -> bool:
     rec = db.execute(
         select(users_table.c.scopes).where(users_table.c.username == username)
@@ -1025,8 +935,6 @@ def _caller_is_admin(db: Session, username: str) -> bool:
         return False
     scopes_list = normalize_scopes(parse_scopes_str(rec.get("scopes")))
     return "admin" in scopes_list
-
-
 @app.get(
     "/users/me/credentials/api.json",
     tags=["Users"],
@@ -1054,14 +962,11 @@ def download_my_api_credentials(
     ).mappings().first()
     if not rec:
         raise HTTPException(status_code=404, detail="User not found")
-
     want_plain = as_bool("plain", plain_str, default=False) or False
     if want_plain and not _caller_is_admin(db, current_user.username):
         raise HTTPException(status_code=403, detail="Admin privileges required for plain export")
-
     payload = _build_api_for_user(dict(rec), request)
     final = _encrypt_payload_if_needed(payload, do_encrypt=not want_plain)
-
     ts = datetime.utcnow().strftime("%Y%m%d")
     filename = f"api_{current_user.username}_{ts}.json"
     return JSONResponse(
@@ -1069,8 +974,6 @@ def download_my_api_credentials(
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
-
 @app.get(
     "/users/{username}/credentials/api.json",
     tags=["Users"],
@@ -1099,11 +1002,9 @@ def download_user_api_credentials(
     ).mappings().first()
     if not rec:
         raise HTTPException(status_code=404, detail="User not found")
-
     want_plain = as_bool("plain", plain_str, default=False) or False
     payload = _build_api_for_user(dict(rec), request)
     final = _encrypt_payload_if_needed(payload, do_encrypt=not want_plain)
-
     ts = datetime.utcnow().strftime("%Y%m%d")
     filename = f"api_{username}_{ts}.json"
     return JSONResponse(
@@ -1111,8 +1012,6 @@ def download_user_api_credentials(
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
-
 # ------------------------------------------------------------------------------------
 # CRUD: Items (Form-only for POST/PUT; textboxes blank)
 # ------------------------------------------------------------------------------------
@@ -1123,8 +1022,6 @@ def get_items(
 ):
     rows = db.execute(select(items_table)).mappings().all()
     return [to_item(dict(r)) for r in rows]
-
-
 @app.get("/items/{item_id}", response_model=Item)
 def get_item(
     item_id_str: str = Path(..., example=""),
@@ -1138,8 +1035,6 @@ def get_item(
     if not row:
         raise HTTPException(status_code=404, detail="Item not found")
     return to_item(dict(row))
-
-
 @app.post("/items", response_model=Item, status_code=201)
 def create_item(
     id_str: str = Form(..., example=""),
@@ -1162,8 +1057,6 @@ def create_item(
         select(items_table).where(items_table.c.id == id_)
     ).mappings().first()
     return to_item(dict(row))
-
-
 @app.put("/items/{item_id}", response_model=Item)
 def update_item(
     item_id: str = Path(..., example=""),
@@ -1186,8 +1079,6 @@ def update_item(
         select(items_table).where(items_table.c.id == item_id)
     ).mappings().first()
     return to_item(dict(row))
-
-
 @app.delete("/items/{item_id}")
 def delete_item(
     item_id: str = Path(..., example=""),
@@ -1200,8 +1091,6 @@ def delete_item(
         raise HTTPException(status_code=404, detail="Item not found")
     db.commit()
     return {"message": "Item deleted"}
-
-
 # ------------------------------------------------------------------------------------
 # Extras — Form-only for POST/PUT; blank query textboxes for GET
 # ------------------------------------------------------------------------------------
@@ -1223,8 +1112,6 @@ def get_extras(
         query = query.where(extras_table.c.name == name)
     rows = db.execute(query).mappings().all()
     return [to_extra(dict(r)) for r in rows]
-
-
 @app.get("/extras/{code}", response_model=Extra, tags=["Extras"])
 def get_extra(
     code: str = Path(..., example=""),
@@ -1238,8 +1125,6 @@ def get_extra(
     if not row:
         raise HTTPException(status_code=404, detail="Extra not found")
     return to_extra(dict(row))
-
-
 @app.post("/extras", response_model=Extra, status_code=201, tags=["Extras"])
 def create_extra(
     extras_code: Optional[str] = Form("", example="001"),
@@ -1307,8 +1192,6 @@ def create_extra(
             select(extras_table).where(extras_table.c.extras_code == extras_code)
         ).mappings().first()
     return to_extra(dict(row)) if row else Extra(**payload)
-
-
 @app.put("/extras/{code}", response_model=Extra, tags=["Extras"])
 def update_extra(
     code: str = Path(..., example=""),
@@ -1372,8 +1255,6 @@ def update_extra(
         select(extras_table).where(extras_table.c.extras_code == code)
     ).mappings().first()
     return to_extra(dict(row))
-
-
 @app.delete("/extras/{code}", tags=["Extras"])
 def delete_extra(
     code: str = Path(..., example=""),
@@ -1386,8 +1267,6 @@ def delete_extra(
         raise HTTPException(status_code=404, detail="Extra not found")
     db.commit()
     return {"message": "Extra deleted"}
-
-
 @app.get("/extras/list", response_model=List[Extra], tags=["Extras"])
 def list_extras(
     current_user: User = Security(get_current_user, scopes=["extras:read"]),
@@ -1403,8 +1282,6 @@ def list_extras(
     query = query.offset(offset).limit(limit)
     rows = db.execute(query).mappings().all()
     return [to_extra(dict(r)) for r in rows]
-
-
 @app.get("/extras/search", response_model=List[Extra], tags=["Extras"])
 def search_extras(
     current_user: User = Security(get_current_user, scopes=["extras:read"]),
@@ -1435,8 +1312,6 @@ def search_extras(
     query = query.offset(offset).limit(limit)
     rows = db.execute(query).mappings().all()
     return [to_extra(dict(r)) for r in rows]
-
-
 # ------------------------------------------------------------------------------------
 # CAR_CONTROL — Form-only for POST/PUT; blank query textboxes for GET
 # ------------------------------------------------------------------------------------
@@ -1459,8 +1334,6 @@ def get_car_control(
     query = query.offset(offset).limit(limit)
     rows = db.execute(query).mappings().all()
     return [to_car_control(dict(r)) for r in rows]
-
-
 @app.get("/car_control/{unit_no}", response_model=CarControl, tags=["Car_Control"])
 def get_car_control_one(
     unit_no: str = Path(..., example=""),
@@ -1474,8 +1347,6 @@ def get_car_control_one(
     if not row:
         raise HTTPException(status_code=404, detail="Car control row not found")
     return to_car_control(dict(row))
-
-
 @app.post("/car_control", response_model=CarControl, status_code=201, tags=["Car_Control"])
 def create_car_control(
     unit_no: Optional[str] = Form("", example="100100000"),
@@ -1613,8 +1484,6 @@ def create_car_control(
         if row:
             return to_car_control(dict(row))
     return to_car_control(payload)
-
-
 @app.put("/car_control/{unit_no}", response_model=CarControl, tags=["Car_Control"])
 def update_car_control(
     unit_no: str = Path(..., example=""),
@@ -1749,8 +1618,6 @@ def update_car_control(
         select(car_control_table).where(car_control_table.c.unit_no == unit_no)
     ).mappings().first()
     return to_car_control(dict(row))
-
-
 @app.delete("/car_control/{unit_no}", tags=["Car_Control"])
 def delete_car_control(
     unit_no: str = Path(..., example=""),
@@ -1763,8 +1630,6 @@ def delete_car_control(
         raise HTTPException(status_code=404, detail="Car control row not found")
     db.commit()
     return {"message": "Car control row deleted"}
-
-
 @app.get("/car_control/list", response_model=List[CarControl], tags=["Car_Control"])
 def list_car_control(
     current_user: User = Security(get_current_user, scopes=["cars:read"]),
@@ -1780,8 +1645,6 @@ def list_car_control(
     query = query.offset(offset).limit(limit)
     rows = db.execute(query).mappings().all()
     return [to_car_control(dict(r)) for r in rows]
-
-
 @app.get("/car_control/search", response_model=List[CarControl], tags=["Car_Control"])
 def search_car_control(
     current_user: User = Security(get_current_user, scopes=["cars:read"]),
@@ -1818,8 +1681,6 @@ def search_car_control(
     query = query.offset(offset).limit(limit)
     rows = db.execute(query).mappings().all()
     return [to_car_control(dict(r)) for r in rows]
-
-
 # ------------------------------------------------------------------------------------
 # Health Check (open)
 # ------------------------------------------------------------------------------------
@@ -1830,8 +1691,6 @@ def health(db: Session = Depends(get_db)):
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
 # ------------------------------------------------------------------------------------
 # Startup
 # ------------------------------------------------------------------------------------
@@ -1870,7 +1729,6 @@ def ensure_tables_and_seed_user():
         if not has_sask_col:
             conn.execute(text("ALTER TABLE users ADD COLUMN sask TEXT"))
             conn.commit()
-
     seed = os.getenv("SEED_DEFAULT_USER", "true").lower() == "true"
     if not seed:
         return
@@ -1892,8 +1750,8 @@ def ensure_tables_and_seed_user():
                     is_active=True,
                     scopes=join_scopes(seed_scopes),
                     token_version=1,
-                    saak=os.getenv("SAAK", ""),
-                    sask=os.getenv("SASK", ""),
+                    saak=os.getenv("SAAK", ""),  # left as-is (env-based)
+                    sask=os.getenv("SASK", ""),  # left as-is (env-based)
                 )
             )
             db.commit()
