@@ -17,3 +17,7 @@ cryptography>=41,<44
 
 # Forms & env
 python-multipart==0.0.9
+
+# DB driver
+psycopg2==2.9.11
+
