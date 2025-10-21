@@ -7,7 +7,6 @@ import hmac
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import List, Optional, Dict, Any, Tuple
-
 from fastapi import (
     FastAPI,
     HTTPException,
@@ -49,27 +48,31 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy.orm import sessionmaker, Session
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Quick notes for runtime robustness
 # - Pin bcrypt to 4.0.1 when using passlib (bcrypt>=4.1 can break passlib<1.7.5) in some envs.
-#   Example requirements: passlib==1.7.4, bcrypt==4.0.1, python-jose[cryptography]==3.3.0
+# Example requirements: passlib==1.7.4, bcrypt==4.0.1, python-jose[cryptography]==3.3.0
 # - Required env vars: SECRET_KEY, CRED_ENC_KEY, DB_URL (or DATABASE_URL / DATABASE_INTERNAL_URL)
-# --------------------------------------------------------------------------------------
-
+# ------------------------------------------------------------------------------------------------
 # Auto-load .env for local/dev runs (safe no-op in prod)
 try:
     from dotenv import load_dotenv  # type: ignore
-
     load_dotenv()
 except Exception:
     pass
+# ------------------------------------------------------------------------------------------------
+# FastAPI App (with ordered tags for a clean Swagger UI)
+# ------------------------------------------------------------------------------------------------
+tags_metadata = [
+    {"name": "Items", "description": "CRUD for Items with List and Search."},
+    {"name": "Extras", "description": "CRUD for Extras with List and Search."},
+    {"name": "Car Control", "description": "CRUD for Car Control with List and Search."},
+    {"name": "Users", "description": "User management and per-user keys."},
+    {"name": "Auth", "description": "Token and logout endpoints."},
+    {"name": "System", "description": "Health checks and diagnostics."},
+]
 
-# --------------------------------------------------------------------------------------
-# FastAPI App
-# --------------------------------------------------------------------------------------
-app = FastAPI(title="Fernando Test API Development")
-
+app = FastAPI(title="Bugzy Test API Development", openapi_tags=tags_metadata)
 # CORS (configure via env CORS_ORIGINS="*")
 app.add_middleware(
     CORSMiddleware,
@@ -78,10 +81,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Database (Render-friendly env vars + scheme normalization)
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 def _resolve_db_url() -> str:
     raw = (
         os.getenv("DB_URL")
@@ -99,26 +101,22 @@ def _resolve_db_url() -> str:
     if raw.startswith("postgres://"):
         raw = raw.replace("postgres://", "postgresql+psycopg2://", 1)
     return raw
-
 DB_URL = _resolve_db_url()
 engine = create_engine(DB_URL, future=True, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 metadata = MetaData()
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # OAuth2 / JWT configuration
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
     raise RuntimeError("SECRET_KEY is required.")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
-
-# --- Encryption for credential JSON (Fernet) ---
+# -- Encryption for credential JSON (Fernet) --
 # CRED_ENC_KEY must be a base64 urlsafe 32-byte key (Fernet)
 # Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 from cryptography.fernet import Fernet  # noqa: E402
-
 CRED_ENC_KEY = os.getenv("CRED_ENC_KEY") or os.getenv("ENCRYPTION_KEY")
 if not CRED_ENC_KEY:
     raise RuntimeError(
@@ -128,14 +126,11 @@ if not CRED_ENC_KEY:
 # Optional key id (useful when rotating keys)
 CRED_ENC_KID = os.getenv("CRED_ENC_KID", "k1")
 _fernet = Fernet(CRED_ENC_KEY.encode() if isinstance(CRED_ENC_KEY, str) else CRED_ENC_KEY)
-
 def _enc_value(v: str) -> str:
     return _fernet.encrypt(v.encode("utf-8")).decode("utf-8")
-
 def _dec_value(v: str) -> str:
     """Decrypt a Fernet token string to plaintext. Raises if invalid."""
     return _fernet.decrypt(v.encode("utf-8")).decode("utf-8")
-
 def _value_is_fernet_token(v: str) -> bool:
     """Best-effort check: return True if v is a valid Fernet token for our key."""
     try:
@@ -143,7 +138,6 @@ def _value_is_fernet_token(v: str) -> bool:
         return True
     except Exception:
         return False
-
 def _decrypt_fields(d: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
     """Return a copy with any Fernet token values in `fields` decrypted to plaintext."""
     out = dict(d)
@@ -152,9 +146,7 @@ def _decrypt_fields(d: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
         if isinstance(val, str) and val.strip() and _value_is_fernet_token(val):
             out[k] = _dec_value(val)
     return out
-
 SENSITIVE_KEYS = ["ci", "cs", "pu", "ot", "saak", "sask"]
-
 def _encrypt_fields(d: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
     out = dict(d)
     encd: List[str] = []
@@ -175,18 +167,15 @@ def _encrypt_fields(d: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
         meta.update({"enc": "fernet-v1", "enc_keys": encd, "kid": CRED_ENC_KID})
         out["_meta"] = meta
     return out
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Token Revocation Logic (in-memory per-token + token_version in DB)
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 revoked_tokens: Dict[str, datetime] = {}
-
 def _cleanup_revoked_tokens(now: Optional[datetime] = None) -> None:
     now = now or datetime.utcnow()
     expired = [tok for tok, exp in revoked_tokens.items() if exp <= now]
     for tok in expired:
         revoked_tokens.pop(tok, None)
-
 def revoke_token(token: str):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -196,24 +185,19 @@ def revoke_token(token: str):
     except Exception:
         # Ignore malformed tokens
         pass
-
 def is_token_revoked(token: str) -> bool:
     _cleanup_revoked_tokens()
     return token in revoked_tokens
-
 # One (and only one) password hashing implementation — Passlib CryptContext
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
         return pwd_context.verify(plain_password, hashed_password)
     except (UnknownHashError, ValueError):
         # Treat invalid/unknown hash as bad credentials, not server error
         return False
-
 def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
-
 SCOPES: Dict[str, str] = {
     "items:read": "Read items",
     "items:write": "Create/update/delete items",
@@ -223,19 +207,15 @@ SCOPES: Dict[str, str] = {
     "cars:write": "Create/update/delete car_control",
     "admin": "Administrative operations",
 }
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", scopes=SCOPES)
 oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="token", scopes=SCOPES, auto_error=False)
-
 KNOWN_SCOPES = set(SCOPES.keys())
 DEFAULT_USER_SCOPES = os.getenv("DEFAULT_USER_SCOPES", "items:read extras:read cars:read").split()
 OPEN_USER_REGISTRATION = os.getenv("OPEN_USER_REGISTRATION", "true").lower() == "true"
-
-# ---- Client credential enforcement (env-driven) --------------------------------------
+# ---- Client credential enforcement (env-driven) ----
 REQUIRE_CLIENT_AUTH = os.getenv("REQUIRE_CLIENT_AUTH", "false").lower() == "true"
 EXPECTED_CLIENT_ID = os.getenv("CLIENT_ID", "")
 EXPECTED_CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
-
 def _extract_basic_auth(request: Request) -> Tuple[Optional[str], Optional[str], str]:
     """
     Returns (client_id, client_secret, source) where source in {"basic","missing","basic-invalid"}.
@@ -252,7 +232,6 @@ def _extract_basic_auth(request: Request) -> Tuple[Optional[str], Optional[str],
         return (None, None, "basic-invalid")
     cid, csec = raw.split(":", 1)
     return (cid, csec, "basic")
-
 def _get_client_credentials(request: Request, client_id_form: Optional[str], client_secret_form: Optional[str]) -> Tuple[Optional[str], Optional[str], str]:
     """
     Prefer HTTP Basic header; fallback to form fields.
@@ -264,27 +243,22 @@ def _get_client_credentials(request: Request, client_id_form: Optional[str], cli
     if client_id_form or client_secret_form:
         return (client_id_form or "", client_secret_form or "", "form")
     return (None, None, src)  # src is "missing" or "basic-invalid"
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Helpers: scopes & strings
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 def normalize_scopes(scopes: Optional[List[str]]) -> List[str]:
     if not scopes:
         return []
     return sorted(set(s for s in scopes if s in KNOWN_SCOPES))
-
 def parse_scopes_str(s: Optional[str]) -> List[str]:
     return [x for x in (s or "").split(" ") if x]
-
 def join_scopes(scopes: List[str]) -> str:
     return " ".join(sorted(set(scopes)))
-
 def parse_scopes_from_form(s: Optional[str]) -> Optional[List[str]]:
     if not s:
         return None
     parts = re.split(r"[\s,]+", s.strip())
     return [p for p in parts if p]
-
 def _strip_str_values(d: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in d.items():
@@ -292,13 +266,11 @@ def _strip_str_values(d: Dict[str, Any]) -> Dict[str, Any]:
             v = v.strip()
         out[k] = v
     return out
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Helpers: parsing textboxes (all inputs are strings in Swagger)
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 def _is_blank(x: Optional[str]) -> bool:
     return x is None or (isinstance(x, str) and x.strip() == "")
-
 def as_int(name: str, value: Optional[str], *, required: bool = False) -> Optional[int]:
     if _is_blank(value):
         if required:
@@ -308,7 +280,6 @@ def as_int(name: str, value: Optional[str], *, required: bool = False) -> Option
         return int(value) if value is not None else None
     except Exception:
         raise HTTPException(status_code=422, detail=f"{name} must be an integer")
-
 def as_float(name: str, value: Optional[str], *, required: bool = False) -> Optional[float]:
     if _is_blank(value):
         if required:
@@ -318,7 +289,6 @@ def as_float(name: str, value: Optional[str], *, required: bool = False) -> Opti
         return float(value) if value is not None else None
     except Exception:
         raise HTTPException(status_code=422, detail=f"{name} must be a number")
-
 def as_bool(name: str, value: Optional[str], default: Optional[bool] = None) -> Optional[bool]:
     if _is_blank(value):
         return default
@@ -328,19 +298,16 @@ def as_bool(name: str, value: Optional[str], default: Optional[bool] = None) -> 
     if v in ("0", "false", "f", "no", "n", "off"):
         return False
     raise HTTPException(status_code=422, detail=f"{name} must be a boolean (true/false)")
-
 def as_str_or_none(value: Optional[str]) -> Optional[str]:
     return None if _is_blank(value) else value
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Pydantic Response Schemas
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 class Item(BaseModel):
     id: int
     name: str
     description: str
     price: float
-
 class Extra(BaseModel):
     extras_code: Optional[str] = None
     name: Optional[str] = None
@@ -362,7 +329,6 @@ class Extra(BaseModel):
     inventory_by_subextra: Optional[int] = None
     sub_extra_lastno: Optional[int] = None
     flat_amount_yn: Optional[str] = None
-
 class CarControl(BaseModel):
     unit_no: Optional[str] = None
     license_no: Optional[str] = None
@@ -412,7 +378,7 @@ class CarControl(BaseModel):
     lease_document_type: Optional[str] = None
     lease_last_agreement: Optional[int] = None
     lease_last_sub_agrno: Optional[int] = None
-    lease_veh_type: Optional[str] = None
+    lease_veh_type: Optional[str] = None  # fixed to str for Pydantic
     crc_chauffeur: Optional[str] = None
     location: Optional[int] = None
     sub_status: Optional[int] = None
@@ -420,7 +386,6 @@ class CarControl(BaseModel):
     mark_preready_stat: Optional[str] = None
     yard_no: Optional[int] = None
     awxx_last_update_date: Optional[str] = None
-
     class Config:
         schema_extra = {
             "example": {
@@ -482,7 +447,6 @@ class CarControl(BaseModel):
                 "awxx_last_update_date": "2025-10-02T07:00:00Z",
             }
         }
-
 def to_item(row: Dict[str, Any]) -> Item:
     price = row["price"]
     if isinstance(price, Decimal):
@@ -493,21 +457,18 @@ def to_item(row: Dict[str, Any]) -> Item:
         description=row["description"],
         price=price,
     )
-
 def to_extra(row: Dict[str, Any]) -> Extra:
     r = {k: (v.strip() if isinstance(v, str) else v) for k, v in dict(row).items()}
     if "vat" in r and isinstance(r["vat"], Decimal):
         r["vat"] = float(r["vat"])
     return Extra(**r)
-
 def to_car_control(row: Dict[str, Any]) -> CarControl:
     # Trim trailing spaces from all string fields before returning
     r = {k: (v.rstrip() if isinstance(v, str) else v) for k, v in dict(row).items()}
     return CarControl(**r)
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # SQLAlchemy Core Table Definitions
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 items_table = Table(
     "items",
     metadata,
@@ -516,7 +477,6 @@ items_table = Table(
     Column("description", String, nullable=False),
     Column("price", Numeric(18, 2), nullable=False),
 )
-
 extras_table = Table(
     "extras",
     metadata,
@@ -541,7 +501,6 @@ extras_table = Table(
     Column("sub_extra_lastno", Integer),
     Column("flat_amount_yn", String(1)),
 )
-
 car_control_table = Table(
     "car_control",
     metadata,
@@ -602,7 +561,6 @@ car_control_table = Table(
     Column("yard_no", Integer, nullable=True),
     Column("awxx_last_update_date", String(20), nullable=True),
 )
-
 users_table = Table(
     "users",
     metadata,
@@ -616,26 +574,23 @@ users_table = Table(
     Column("saak", String, nullable=True),
     Column("sask", String, nullable=True),
 )
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # DB Session Dependency
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 def get_db() -> Session:
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Auth Helpers
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 def get_user_by_username(db: Session, username: str) -> Optional[Dict[str, Any]]:
     row = db.execute(
         select(users_table).where(users_table.c.username == username)
     ).mappings().first()
     return dict(row) if row else None
-
 def authenticate_user(db: Session, username: str, password: str) -> Optional[Dict[str, Any]]:
     user = get_user_by_username(db, username)
     if not user:
@@ -645,17 +600,14 @@ def authenticate_user(db: Session, username: str, password: str) -> Optional[Dic
     if not user.get("is_active", True):
         return None
     return user
-
 def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
 class User(BaseModel):
     username: str
     is_active: bool = True
-
 def get_current_user(
     security_scopes: SecurityScopes,
     token: str = Depends(oauth2_scheme),
@@ -700,14 +652,12 @@ def get_current_user(
         return User(username=user_record["username"], is_active=user_record.get("is_active", True))
     except JWTError:
         raise credentials_exception
-
 def get_current_active_user(
     current_user: User = Security(get_current_user, scopes=[]),
 ) -> User:
     if not current_user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
-
 def require_admin_if_closed(token: Optional[str], db: Session) -> None:
     if OPEN_USER_REGISTRATION:
         return
@@ -741,10 +691,9 @@ def require_admin_if_closed(token: Optional[str], db: Session) -> None:
             detail="Invalid token",
             headers={"WWW-Authenticate": auth_header},
         )
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Helper Functions (ordering & filters)
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 def apply_ordering(query, table, order_by: Optional[str], default_col: str) -> Tuple[Any, Optional[str]]:
     if not order_by:
         col = getattr(table.c, default_col, None)
@@ -761,15 +710,13 @@ def apply_ordering(query, table, order_by: Optional[str], default_col: str) -> T
         direction = "asc"
     query = query.order_by(col.asc() if direction == "asc" else col.desc())
     return query, f"{col_name}:{direction}"
-
 def like_or_equals(col, value: Optional[str], partial: bool):
     if value is None:
         return None
     return col.ilike(f"%{value}%") if partial else (col == value)
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Auth: Token endpoint (now enforces client credentials when enabled)
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 @app.post("/token", tags=["Auth"])
 def login_for_access_token(
     request: Request,
@@ -803,7 +750,6 @@ def login_for_access_token(
                 detail="Invalid client credentials",
                 headers={"WWW-Authenticate": 'Basic realm="token", error="invalid_client"'},
             )
-
     # --- Resource owner password validation ---
     user = authenticate_user(db, username, password)
     if not user:
@@ -812,7 +758,6 @@ def login_for_access_token(
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-
     requested = normalize_scopes(parse_scopes_from_form(scope) or [])
     allowed = normalize_scopes(parse_scopes_str(user.get("scopes")) or DEFAULT_USER_SCOPES)
     granted = requested if requested else allowed
@@ -822,10 +767,9 @@ def login_for_access_token(
         data={"sub": user["username"], "scopes": granted, "ver": ver}
     )
     return {"access_token": access_token, "token_type": "bearer"}
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Users: Register (Form-only), Me, Logout
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 @app.post("/users/register", status_code=201, tags=["Users"])
 def register_user(
     username: str = Form(..., min_length=3, max_length=50, description="Letters, digits, underscore, dot, dash", example=""),
@@ -850,11 +794,9 @@ def register_user(
         raise HTTPException(status_code=409, detail="Username already exists")
     scopes_in = parse_scopes_from_form(scopes_text)
     scopes = normalize_scopes(scopes_in) if scopes_in is not None else normalize_scopes(DEFAULT_USER_SCOPES)
-
-    # --- Store encrypted-at-rest mirrors of entered username/password ---
+    # -- Store encrypted-at-rest mirrors of entered username/password --
     enc_saak = _enc_value(username.strip())
     enc_sask = _enc_value(password.strip())
-
     db.execute(
         insert(users_table).values(
             username=username,
@@ -868,7 +810,6 @@ def register_user(
     )
     db.commit()
     return {"username": username, "is_active": True, "scopes": scopes}
-
 @app.get("/users/me", response_model=Dict[str, Any], tags=["Users"])
 def read_users_me(
     current_user: User = Security(get_current_user, scopes=[]),
@@ -881,7 +822,6 @@ def read_users_me(
         raise HTTPException(status_code=404, detail="User not found")
     allowed_scopes = normalize_scopes(parse_scopes_str(rec.get("scopes")))
     return {"username": current_user.username, "is_active": current_user.is_active, "scopes": allowed_scopes}
-
 @app.post("/logout", tags=["Auth"])
 def logout_current(
     current_user: User = Security(get_current_user, scopes=[]),
@@ -894,10 +834,9 @@ def logout_current(
     )
     db.commit()
     return {"message": "Logged out (all tokens invalidated)"}
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Users: manage per-user keys
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 @app.put("/users/me/keys", tags=["Users"])
 def update_my_keys(
     saak: Optional[str] = Form("", description="User access key (optional)", example=""),
@@ -919,7 +858,6 @@ def update_my_keys(
         raise HTTPException(status_code=404, detail="User not found")
     db.commit()
     return {"username": current_user.username, "updated": list(vals.keys())}
-
 @app.put("/users/{username}/keys", tags=["Users"])
 def update_user_keys(
     username: str = Path(..., description="Target username"),
@@ -940,10 +878,9 @@ def update_user_keys(
         raise HTTPException(status_code=404, detail="User not found")
     db.commit()
     return {"username": username, "updated": list(vals.keys())}
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Users: Download Credentials (JSON only, admin-only list)
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 @app.get(
     "/users/credentials/download",
     tags=["Users"],
@@ -993,10 +930,9 @@ def download_user_credentials_json(
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Credential Builders & Endpoints (short-key JSON, with encryption and plain toggle)
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 def _build_api_for_user(user_record: Dict[str, Any], request: Request) -> Dict[str, Any]:
     """
     Build an API short-key credential JSON for Postman/clients.
@@ -1005,21 +941,17 @@ def _build_api_for_user(user_record: Dict[str, Any], request: Request) -> Dict[s
     """
     username = user_record["username"]
     scopes_list = normalize_scopes(parse_scopes_str(user_record.get("scopes")))
-
     base_url = str(request.base_url).rstrip("/")
     token_full = f"{base_url}/token"
-
     # Prefer per-user values; fallback to env
     tenant_id = os.getenv("TENANT_ID") or "local"
     client_name = os.getenv("CLIENT_NAME") or f"{username}@{tenant_id}"
     client_id = os.getenv("CLIENT_ID", "")
     client_secret = os.getenv("CLIENT_SECRET", "")
     env_name = os.getenv("ENVIRONMENT", os.getenv("ENV", "DEV"))
-
     # Per-user keys first
     saak = (user_record.get("saak") or os.getenv("SAAK") or "")
     sask = (user_record.get("sask") or os.getenv("SASK") or "")
-
     payload = {
         "ti": tenant_id,
         "cn": client_name,
@@ -1040,7 +972,6 @@ def _build_api_for_user(user_record: Dict[str, Any], request: Request) -> Dict[s
         "scopes": scopes_list,
     }
     return payload
-
 def _encrypt_payload_if_needed(
     payload: Dict[str, Any],
     *,
@@ -1054,7 +985,6 @@ def _encrypt_payload_if_needed(
         return cp
     # Encrypt only sensitive keys; keep iu/oa visible
     return _encrypt_fields(payload, SENSITIVE_KEYS)
-
 def _caller_is_admin(db: Session, username: str) -> bool:
     rec = db.execute(
         select(users_table.c.scopes).where(users_table.c.username == username)
@@ -1063,7 +993,6 @@ def _caller_is_admin(db: Session, username: str) -> bool:
         return False
     scopes_list = normalize_scopes(parse_scopes_str(rec.get("scopes")))
     return "admin" in scopes_list
-
 @app.get(
     "/users/me/credentials/api.json",
     tags=["Users"],
@@ -1099,7 +1028,6 @@ def download_my_api_credentials(
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
 @app.get(
     "/users/{username}/credentials/api.json",
     tags=["Users"],
@@ -1134,33 +1062,39 @@ def download_user_api_credentials(
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
-# --------------------------------------------------------------------------------------
-# CRUD: Items (Form-only for POST/PUT; textboxes blank)
-# --------------------------------------------------------------------------------------
-@app.get("/items", response_model=List[Item])
-def get_items(
+# ------------------------------------------------------------------------------------------------
+# CRUD: Items — canonical LIST, SEARCH, and standard CRUD
+# ------------------------------------------------------------------------------------------------
+@app.get("/items", response_model=List[Item], tags=["Items"], summary="List items")
+def list_items(
     current_user: User = Security(get_current_user, scopes=["items:read"]),
     db: Session = Depends(get_db),
+    # Paging & ordering only; filtering is for /items/search
+    limit_str: Optional[str] = Query("", example="100"),
+    offset_str: Optional[str] = Query("", example="0"),
+    order_by: Optional[str] = Query("", description='e.g. "id:asc" or "name:desc"'),
 ):
-    rows = db.execute(select(items_table)).mappings().all()
+    limit = as_int("limit", limit_str) or 100
+    offset = as_int("offset", offset_str) or 0
+    q = select(items_table)
+    q, _ = apply_ordering(q, items_table, order_by, default_col="id")
+    q = q.offset(offset).limit(limit)
+    rows = db.execute(q).mappings().all()
     return [to_item(dict(r)) for r in rows]
-
-@app.get("/items/{item_id}", response_model=Item)
+@app.get("/items/{item_id}", response_model=Item, tags=["Items"])
 def get_item(
-    item_id_str: str = Path(..., example=""),
+    item_id: str = Path(..., example=""),
     current_user: User = Security(get_current_user, scopes=["items:read"]),
     db: Session = Depends(get_db),
 ):
-    item_id = as_int("item_id", item_id_str, required=True)
+    item_id_val = as_int("item_id", item_id, required=True)
     row = db.execute(
-        select(items_table).where(items_table.c.id == item_id)
+        select(items_table).where(items_table.c.id == item_id_val)
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Item not found")
     return to_item(dict(row))
-
-@app.post("/items", response_model=Item, status_code=201)
+@app.post("/items", response_model=Item, status_code=201, tags=["Items"])
 def create_item(
     id_str: str = Form(..., example=""),
     name: str = Form(..., example="GPS"),
@@ -1182,8 +1116,7 @@ def create_item(
         select(items_table).where(items_table.c.id == id_)
     ).mappings().first()
     return to_item(dict(row))
-
-@app.put("/items/{item_id}", response_model=Item)
+@app.put("/items/{item_id}", response_model=Item, tags=["Items"])
 def update_item(
     item_id: str = Path(..., example=""),
     name: str = Form(..., example="GPS"),
@@ -1192,55 +1125,73 @@ def update_item(
     current_user: User = Security(get_current_user, scopes=["items:write"]),
     db: Session = Depends(get_db),
 ):
-    item_id = as_int("item_id", item_id, required=True)
+    item_id_val = as_int("item_id", item_id, required=True)
     price = as_float("price", price_str, required=True)
     values = {"name": name.strip(), "description": description.strip(), "price": price}
     res = db.execute(
-        update(items_table).where(items_table.c.id == item_id).values(**values)
+        update(items_table).where(items_table.c.id == item_id_val).values(**values)
     )
     if res.rowcount == 0:
         raise HTTPException(status_code=404, detail="Item not found")
     db.commit()
     row = db.execute(
-        select(items_table).where(items_table.c.id == item_id)
+        select(items_table).where(items_table.c.id == item_id_val)
     ).mappings().first()
     return to_item(dict(row))
-
-@app.delete("/items/{item_id}")
+@app.delete("/items/{item_id}", tags=["Items"])
 def delete_item(
     item_id: str = Path(..., example=""),
     current_user: User = Security(get_current_user, scopes=["items:write"]),
     db: Session = Depends(get_db),
 ):
-    item_id = as_int("item_id", item_id, required=True)
-    res = db.execute(delete(items_table).where(items_table.c.id == item_id))
+    item_id_val = as_int("item_id", item_id, required=True)
+    res = db.execute(delete(items_table).where(items_table.c.id == item_id_val))
     if res.rowcount == 0:
         raise HTTPException(status_code=404, detail="Item not found")
     db.commit()
     return {"message": "Item deleted"}
-
-# --------------------------------------------------------------------------------------
-# Extras — Form-only for POST/PUT; blank query textboxes for GET
-# --------------------------------------------------------------------------------------
-@app.get("/extras", response_model=List[Extra], tags=["Extras (compat)"])
-def get_extras(
+@app.get("/items/search", response_model=List[Item], tags=["Items"], summary="Search items")
+def search_items(
+    current_user: User = Security(get_current_user, scopes=["items:read"]),
+    db: Session = Depends(get_db),
+    id_str: Optional[str] = Query("", alias="ID", example="1"),
+    name: Optional[str] = Query("", alias="NAME", example="MOUSE"),
+    partial_str: Optional[str] = Query("", description="Use partial matches (ILIKE) when true"),
+    limit_str: Optional[str] = Query("", example="100"),
+    offset_str: Optional[str] = Query("", example="0"),
+    order_by: Optional[str] = Query("", description='e.g. "name:asc" or "id:desc"'),
+):
+    partial = as_bool("partial", partial_str, default=True)
+    limit = as_int("limit", limit_str) or 100
+    offset = as_int("offset", offset_str) or 0
+    id_val = as_int("id", id_str)
+    q = select(items_table)
+    if id_val is not None:
+        q = q.where(items_table.c.id == id_val)
+    if not _is_blank(name):
+        q = q.where(items_table.c.name.ilike(f"%{name}%") if partial else (items_table.c.name == name))
+    q, _ = apply_ordering(q, items_table, order_by, default_col="id")
+    q = q.offset(offset).limit(limit)
+    rows = db.execute(q).mappings().all()
+    return [to_item(dict(r)) for r in rows]
+# ------------------------------------------------------------------------------------------------
+# Extras — unified LIST and SEARCH; standard CRUD (removed /extras/list)
+# ------------------------------------------------------------------------------------------------
+@app.get("/extras", response_model=List[Extra], tags=["Extras"], summary="List extras")
+def list_extras(
     current_user: User = Security(get_current_user, scopes=["extras:read"]),
     db: Session = Depends(get_db),
-    extras_code: Optional[str] = Query("", alias="EXTRAS_CODE", example=""),
-    name: Optional[str] = Query("", alias="NAME", example=""),
+    limit_str: Optional[str] = Query("", example="100"),
+    offset_str: Optional[str] = Query("", example="0"),
+    order_by: Optional[str] = Query("", description='e.g. "extras_code:asc"'),
 ):
-    extras_code = as_str_or_none(extras_code)
-    name = as_str_or_none(name)
-    if not extras_code and not name:
-        raise HTTPException(status_code=422, detail="Either extras_code or name must be provided")
+    limit = as_int("limit", limit_str) or 100
+    offset = as_int("offset", offset_str) or 0
     query = select(extras_table)
-    if extras_code:
-        query = query.where(extras_table.c.extras_code == extras_code)
-    if name:
-        query = query.where(extras_table.c.name == name)
+    query, _ = apply_ordering(query, extras_table, order_by, default_col="extras_code")
+    query = query.offset(offset).limit(limit)
     rows = db.execute(query).mappings().all()
     return [to_extra(dict(r)) for r in rows]
-
 @app.get("/extras/{code}", response_model=Extra, tags=["Extras"])
 def get_extra(
     code: str = Path(..., example=""),
@@ -1254,7 +1205,6 @@ def get_extra(
     if not row:
         raise HTTPException(status_code=404, detail="Extra not found")
     return to_extra(dict(row))
-
 @app.post("/extras", response_model=Extra, status_code=201, tags=["Extras"])
 def create_extra(
     extras_code: Optional[str] = Form("", example="001"),
@@ -1322,7 +1272,6 @@ def create_extra(
             select(extras_table).where(extras_table.c.extras_code == extras_code)
         ).mappings().first()
     return to_extra(dict(row)) if row else Extra(**payload)
-
 @app.put("/extras/{code}", response_model=Extra, tags=["Extras"])
 def update_extra(
     code: str = Path(..., example=""),
@@ -1386,7 +1335,6 @@ def update_extra(
         select(extras_table).where(extras_table.c.extras_code == code)
     ).mappings().first()
     return to_extra(dict(row))
-
 @app.delete("/extras/{code}", tags=["Extras"])
 def delete_extra(
     code: str = Path(..., example=""),
@@ -1399,24 +1347,7 @@ def delete_extra(
         raise HTTPException(status_code=404, detail="Extra not found")
     db.commit()
     return {"message": "Extra deleted"}
-
-@app.get("/extras/list", response_model=List[Extra], tags=["Extras"])
-def list_extras(
-    current_user: User = Security(get_current_user, scopes=["extras:read"]),
-    db: Session = Depends(get_db),
-    limit_str: Optional[str] = Query("", example=""),
-    offset_str: Optional[str] = Query("", example=""),
-    order_by: Optional[str] = Query("", description='e.g. "extras_code:asc"', example=""),
-):
-    limit = as_int("limit", limit_str) or 100
-    offset = as_int("offset", offset_str) or 0
-    query = select(extras_table)
-    query, _ = apply_ordering(query, extras_table, order_by, default_col="extras_code")
-    query = query.offset(offset).limit(limit)
-    rows = db.execute(query).mappings().all()
-    return [to_extra(dict(r)) for r in rows]
-
-@app.get("/extras/search", response_model=List[Extra], tags=["Extras"])
+@app.get("/extras/search", response_model=List[Extra], tags=["Extras"], summary="Search extras")
 def search_extras(
     current_user: User = Security(get_current_user, scopes=["extras:read"]),
     db: Session = Depends(get_db),
@@ -1425,8 +1356,8 @@ def search_extras(
     group_str: Optional[str] = Query("", alias="EXTRA_GROUP", example=""),
     inventory: Optional[str] = Query("", alias="INVENTORY", example=""),
     partial_str: Optional[str] = Query("", description="Use partial matches (ILIKE)", example=""),
-    limit_str: Optional[str] = Query("", example=""),
-    offset_str: Optional[str] = Query("", example=""),
+    limit_str: Optional[str] = Query("", example="100"),
+    offset_str: Optional[str] = Query("", example="0"),
     order_by: Optional[str] = Query("", description='e.g. "name:asc"', example=""),
 ):
     partial = as_bool("partial", partial_str, default=True)
@@ -1446,31 +1377,25 @@ def search_extras(
     query = query.offset(offset).limit(limit)
     rows = db.execute(query).mappings().all()
     return [to_extra(dict(r)) for r in rows]
-
-# --------------------------------------------------------------------------------------
-# CAR_CONTROL — Form-only for POST/PUT; blank query textboxes for GET
-# --------------------------------------------------------------------------------------
-@app.get("/car_control", response_model=List[CarControl], tags=["Car_Control (compat)"])
-def get_car_control(
+# ------------------------------------------------------------------------------------------------
+# CAR_CONTROL — consistent tag "Car Control"; LIST, SEARCH, CRUD (+ DELETE added)
+# ------------------------------------------------------------------------------------------------
+@app.get("/car_control", response_model=List[CarControl], tags=["Car Control"], summary="List car control rows")
+def list_car_control(
     current_user: User = Security(get_current_user, scopes=["cars:read"]),
     db: Session = Depends(get_db),
-    unit_no: Optional[str] = Query("", alias="UNIT_NO", example=""),
-    license_no: Optional[str] = Query("", alias="LICENSE_NO", example=""),
-    limit_str: Optional[str] = Query("", example=""),
-    offset_str: Optional[str] = Query("", example=""),
+    limit_str: Optional[str] = Query("", example="100"),
+    offset_str: Optional[str] = Query("", example="0"),
+    order_by: Optional[str] = Query("", description='e.g. "unit_no:asc"'),
 ):
     limit = as_int("limit", limit_str) or 100
     offset = as_int("offset", offset_str) or 0
-    query = select(car_control_table)
-    if not _is_blank(unit_no):
-        query = query.where(car_control_table.c.unit_no == unit_no)
-    if not _is_blank(license_no):
-        query = query.where(car_control_table.c.license_no == license_no)
-    query = query.offset(offset).limit(limit)
-    rows = db.execute(query).mappings().all()
+    q = select(car_control_table)
+    q, _ = apply_ordering(q, car_control_table, order_by, default_col="unit_no")
+    q = q.offset(offset).limit(limit)
+    rows = db.execute(q).mappings().all()
     return [to_car_control(dict(r)) for r in rows]
-
-@app.get("/car_control/{unit_no}", response_model=CarControl, tags=["Car_Control"])
+@app.get("/car_control/{unit_no}", response_model=CarControl, tags=["Car Control"])
 def get_car_control_one(
     unit_no: str = Path(..., example=""),
     current_user: User = Security(get_current_user, scopes=["cars:read"]),
@@ -1483,8 +1408,7 @@ def get_car_control_one(
     if not row:
         raise HTTPException(status_code=404, detail="Car control row not found")
     return to_car_control(dict(row))
-
-@app.post("/car_control", response_model=CarControl, status_code=201, tags=["Car_Control"])
+@app.post("/car_control", response_model=CarControl, status_code=201, tags=["Car Control"])
 def create_car_control(
     unit_no: Optional[str] = Form("", example="100100000"),
     license_no: Optional[str] = Form("", example="6929HJD"),
@@ -1621,8 +1545,103 @@ def create_car_control(
         if row:
             return to_car_control(dict(row))
     return to_car_control(payload)
-
-@app.put("/car_control/{unit_no}", response_model=CarControl, tags=["Car_Control"])
+@app.get("/car_control/search", response_model=List[CarControl], tags=["Car Control"], summary="Search car control")
+def search_car_control(
+    current_user: User = Security(get_current_user, scopes=["cars:read"]),
+    db: Session = Depends(get_db),
+    # --- Common filters (UPPER-CASE aliases visible in Swagger/UI) ---
+    unit_no: Optional[str] = Query("", alias="UNIT_NO"),
+    license_no: Optional[str] = Query("", alias="LICENSE_NO"),
+    company_code_str: Optional[str] = Query("", alias="COMPANY_CODE"),
+    fleet_assignment: Optional[str] = Query("", alias="FLEET_ASSIGNMENT"),
+    f_group: Optional[str] = Query("", alias="F_GROUP"),
+    car_make_str: Optional[str] = Query("", alias="CAR_MAKE"),
+    model_str: Optional[str] = Query("", alias="MODEL"),
+    color: Optional[str] = Query("", alias="COLOR"),
+    car_status_str: Optional[str] = Query("", alias="CAR_STATUS"),
+    branach_str: Optional[str] = Query("", alias="BRANACH"),
+    current_odometer_str: Optional[str] = Query("", alias="CURRENT_ODOMETER"),
+    vehicle_type: Optional[str] = Query("", alias="VEHICLE_TYPE"),
+    sale_cycle_str: Optional[str] = Query("", alias="SALE_CYCLE"),
+    fleet_sub_assignment_str: Optional[str] = Query("", alias="FLEET_SUB_ASSIGNMENT"),
+    smoke: Optional[str] = Query("", alias="SMOKE"),
+    garage_str: Optional[str] = Query("", alias="GARAGE"),
+    petrol_level_str: Optional[str] = Query("", alias="PETROL_LEVEL"),
+    location_str: Optional[str] = Query("", alias="LOCATION"),
+    sub_status_str: Optional[str] = Query("", alias="SUB_STATUS"),
+    lease_veh_type: Optional[str] = Query("", alias="LEASE_VEH_TYPE"),
+    # --- Search behavior & paging ---
+    partial_str: Optional[str] = Query("", description="Use partial matches (ILIKE) when true"),
+    limit_str: Optional[str] = Query(""),
+    offset_str: Optional[str] = Query(""),
+    order_by: Optional[str] = Query("", description='e.g. "unit_no:asc" or "license_no:desc"'),
+):
+    # Parse flags / paging
+    partial = as_bool("partial", partial_str, default=True)
+    limit = as_int("limit", limit_str) or 100
+    offset = as_int("offset", offset_str) or 0
+    # Parse numerics
+    company_code = as_int("company_code", company_code_str)
+    car_make = as_int("car_make", car_make_str)
+    model = as_int("model", model_str)
+    car_status = as_int("car_status", car_status_str)
+    branach = as_int("branach", branach_str)
+    current_odometer = as_int("current_odometer", current_odometer_str)
+    sale_cycle = as_int("sale_cycle", sale_cycle_str)
+    fleet_sub_assignment = as_int("fleet_sub_assignment", fleet_sub_assignment_str)
+    garage = as_int("garage", garage_str)
+    petrol_level = as_int("petrol_level", petrol_level_str)
+    location = as_int("location", location_str)
+    sub_status = as_int("sub_status", sub_status_str)
+    # Build query
+    q = select(car_control_table)
+    # Strings: partial/exact via like_or_equals; Numerics: exact equality
+    if not _is_blank(unit_no):
+        q = q.where(like_or_equals(car_control_table.c.unit_no, unit_no, partial))
+    if not _is_blank(license_no):
+        q = q.where(like_or_equals(car_control_table.c.license_no, license_no, partial))
+    if company_code is not None:
+        q = q.where(car_control_table.c.company_code == company_code)
+    if not _is_blank(fleet_assignment):
+        q = q.where(like_or_equals(car_control_table.c.fleet_assignment, fleet_assignment, partial))
+    if not _is_blank(f_group):
+        q = q.where(like_or_equals(car_control_table.c.f_group, f_group, partial))
+    if car_make is not None:
+        q = q.where(car_control_table.c.car_make == car_make)
+    if model is not None:
+        q = q.where(car_control_table.c.model == model)
+    if not _is_blank(color):
+        q = q.where(like_or_equals(car_control_table.c.color, color, partial))
+    if car_status is not None:
+        q = q.where(car_control_table.c.car_status == car_status)
+    if branach is not None:
+        q = q.where(car_control_table.c.branach == branach)
+    if current_odometer is not None:
+        q = q.where(car_control_table.c.current_odometer == current_odometer)
+    if not _is_blank(vehicle_type):
+        q = q.where(like_or_equals(car_control_table.c.vehicle_type, vehicle_type, partial))
+    if sale_cycle is not None:
+        q = q.where(car_control_table.c.sale_cycle == sale_cycle)
+    if fleet_sub_assignment is not None:
+        q = q.where(car_control_table.c.fleet_sub_assignment == fleet_sub_assignment)
+    if not _is_blank(smoke):
+        q = q.where(like_or_equals(car_control_table.c.smoke, smoke, partial))
+    if garage is not None:
+        q = q.where(car_control_table.c.garage == garage)
+    if petrol_level is not None:
+        q = q.where(car_control_table.c.petrol_level == petrol_level)
+    if location is not None:
+        q = q.where(car_control_table.c.location == location)
+    if sub_status is not None:
+        q = q.where(car_control_table.c.sub_status == sub_status)
+    if not _is_blank(lease_veh_type):
+        q = q.where(like_or_equals(car_control_table.c.lease_veh_type, lease_veh_type, partial))
+    # Ordering + paging
+    q, _ = apply_ordering(q, car_control_table, order_by, default_col="unit_no")
+    q = q.offset(offset).limit(limit)
+    rows = db.execute(q).mappings().all()
+    return [to_car_control(dict(r)) for r in rows]
+@app.put("/car_control/{unit_no}", response_model=CarControl, tags=["Car Control"])
 def update_car_control(
     unit_no: str = Path(..., example=""),
     license_no: Optional[str] = Form("", example="6929HJD"),
@@ -1756,26 +1775,35 @@ def update_car_control(
         select(car_control_table).where(car_control_table.c.unit_no == unit_no)
     ).mappings().first()
     return to_car_control(dict(row))
-
-# --------------------------------------------------------------------------------------
-# Health Check (open)
-# --------------------------------------------------------------------------------------
-@app.get("/health")
+@app.delete("/car_control/{unit_no}", tags=["Car Control"], summary="Delete car control row")
+def delete_car_control(
+    unit_no: str = Path(..., example="100100000"),
+    current_user: User = Security(get_current_user, scopes=["cars:write"]),
+    db: Session = Depends(get_db),
+):
+    unit_no = unit_no.strip()
+    res = db.execute(delete(car_control_table).where(car_control_table.c.unit_no == unit_no))
+    if res.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Car control row not found")
+    db.commit()
+    return {"message": "Car control row deleted"}
+# ------------------------------------------------------------------------------------------------
+# Health Check (tagged to avoid "Default" section)
+# ------------------------------------------------------------------------------------------------
+@app.get("/health", tags=["System"])
 def health(db: Session = Depends(get_db)):
     try:
         db.execute(select(1))
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Startup
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 @app.on_event("startup")
 def ensure_tables_and_seed_user():
     # Create missing tables if they don't exist
     metadata.create_all(engine)
-
     # Try to ensure columns exist when running on Postgres. For other dialects, skip these
     # ALTERs (metadata.create_all covers new deployments).
     try:
@@ -1791,7 +1819,6 @@ def ensure_tables_and_seed_user():
                 if not has_scopes_col:
                     conn.execute(text("ALTER TABLE users ADD COLUMN scopes TEXT"))
                     conn.commit()
-
                 # token_version column
                 has_ver_col = conn.execute(text(
                     """
@@ -1802,7 +1829,6 @@ def ensure_tables_and_seed_user():
                 if not has_ver_col:
                     conn.execute(text("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1"))
                     conn.commit()
-
                 # per-user keys columns
                 has_saak_col = conn.execute(text(
                     """
@@ -1813,7 +1839,6 @@ def ensure_tables_and_seed_user():
                 if not has_saak_col:
                     conn.execute(text("ALTER TABLE users ADD COLUMN saak TEXT"))
                     conn.commit()
-
                 has_sask_col = conn.execute(text(
                     """
                     SELECT 1 FROM information_schema.columns
@@ -1826,34 +1851,10 @@ def ensure_tables_and_seed_user():
     except Exception as _e:
         # Non-fatal; schema drift checks are best-effort
         pass
-
     seed = os.getenv("SEED_DEFAULT_USER", "true").lower() == "true"
     if not seed:
         return
-
     with SessionLocal() as db:
         existing = db.execute(
             select(users_table.c.username).where(users_table.c.username == "bugzy")
-        ).first()
-        if not existing:
-            seed_scopes = [
-                "items:read",
-                "items:write",
-                "extras:read",
-                "extras:write",
-                "cars:read",
-                "cars:write",
-                "admin",
-            ]
-            db.execute(
-                insert(users_table).values(
-                    username="bugzy",
-                    hashed_password=get_password_hash("P@ssw0rd!"),
-                    is_active=True,
-                    scopes=join_scopes(seed_scopes),
-                    token_version=1,
-                    saak=os.getenv("SAAK", ""),  # left as-is (env-based)
-                    sask=os.getenv("SASK", ""),  # left as-is (env-based)
-                )
-            )
-            db.commit()
+        )
