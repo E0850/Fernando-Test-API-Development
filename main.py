@@ -23,6 +23,8 @@ from fastapi.security import (
     SecurityScopes,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from jose import JWTError, jwt
@@ -81,6 +83,70 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---- Dark-mode Swagger UI (reliable and high-contrast) ----
+@app.get("/swagger-dark.css", include_in_schema=False)
+def swagger_dark_css():
+    css = """
+@import url('https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.11.0/swagger-ui.css');
+:root {
+  color-scheme: dark;
+  --bg:#0d1117;
+  --text:#e6edf3;
+  --muted:#c3cbd3;
+  --panel:#0f172a;
+  --panel-2:#111827;
+  --summary:#1f2937;
+  --border:#374151;
+  --code:#0b1220;
+  --link:#93c5fd;
+  --get:#3b82f6; --post:#22c55e; --put:#f59e0b; --delete:#ef4444; --patch:#a855f7;
+}
+html,body,.swagger-ui{background-color:var(--bg)!important;color:var(--text)!important;}
+.swagger-ui .topbar{background:var(--panel-2)!important;border-bottom:1px solid var(--border)!important;}
+.swagger-ui .info,.swagger-ui .markdown,.swagger-ui .markdown p,.swagger-ui .info .title,.swagger-ui .title,.swagger-ui .opblock-tag{color:var(--text)!important;}
+.swagger-ui .opblock{background:var(--panel)!important;border-color:var(--border)!important;box-shadow:none!important;}
+.swagger-ui .opblock .opblock-summary{background:var(--summary)!important;color:var(--text)!important;}
+.swagger-ui .opblock-summary-method{background:transparent!important;border:1px solid var(--border)!important;color:var(--text)!important;}
+.swagger-ui .opblock-summary-path,.swagger-ui .opblock-summary-path__deprecated,.swagger-ui .opblock-summary-description{color:var(--text)!important;}
+.swagger-ui .opblock-description-wrapper,.swagger-ui .opblock-external-docs-wrapper{color:var(--text)!important;}
+.swagger-ui .opblock.opblock-get{border-left:4px solid var(--get)!important;}
+.swagger-ui .opblock.opblock-post{border-left:4px solid var(--post)!important;}
+.swagger-ui .opblock.opblock-put{border-left:4px solid var(--put)!important;}
+.swagger-ui .opblock.opblock-delete{border-left:4px solid var(--delete)!important;}
+.swagger-ui .opblock.opblock-patch{border-left:4px solid var(--patch)!important;}
+.swagger-ui .parameters,.swagger-ui .request-body,.swagger-ui .responses-wrapper,.swagger-ui .responses-inner,
+.swagger-ui .response,.swagger-ui .model,.swagger-ui .model-box,.swagger-ui .model-box .model-jump-to-path{
+  background:var(--panel-2)!important;color:var(--text)!important;border-color:var(--border)!important;
+}
+.swagger-ui table thead tr,.swagger-ui table tbody tr{background:var(--panel-2)!important;color:var(--text)!important;}
+.swagger-ui table thead tr th,.swagger-ui table tbody tr td{border-color:var(--border)!important;color:var(--text)!important;}
+.swagger-ui .parameter__name,.swagger-ui .parameter__type,.swagger-ui .prop-format,.swagger-ui .parameter__in,
+.swagger-ui .model-title__text,.swagger-ui .prop-type,.swagger-ui .model .property .prop-type{color:var(--muted)!important;}
+.swagger-ui .btn,.swagger-ui select,.swagger-ui input,.swagger-ui textarea{
+  background:var(--code)!important;color:var(--text)!important;border:1px solid var(--border)!important;box-shadow:none!important;
+}
+.swagger-ui .btn.authorize span{color:var(--text)!important;}
+.swagger-ui ::placeholder{color:#9ca3af!important;}
+.swagger-ui .response-col_status,.swagger-ui .response-col_description{color:var(--text)!important;}
+.swagger-ui .tab li,.swagger-ui .tab li a{color:var(--text)!important;}
+.swagger-ui .markdown code,.swagger-ui code,.swagger-ui pre{background:var(--code)!important;color:var(--text)!important;border:1px solid var(--border)!important;}
+.swagger-ui a{color:var(--link)!important;} .swagger-ui a:hover{color:#bfdbfe!important;}
+.swagger-ui .model-toggle,.swagger-ui .model-box-control,.swagger-ui .expand-operation{color:var(--muted)!important;}
+.swagger-ui .arrow,.swagger-ui .expand-methods svg,.swagger-ui .expand-operation svg{fill:var(--muted)!important;stroke:var(--muted)!important;}
+"""
+    return Response(content=css, media_type="text/css")
+
+@app.get("/docs-dark", include_in_schema=False)
+def docs_dark():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - Docs (Dark)",
+        swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.11.0/swagger-ui-bundle.js",
+        swagger_css_url="/swagger-dark.css?v=2",  # cache-bust to ensure latest CSS loads
+        swagger_favicon_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.11.0/favicon-32x32.png",
+    )
+
 # ------------------------------------------------------------------------------------------------
 # Database (Render-friendly env vars + scheme normalization)
 # ------------------------------------------------------------------------------------------------
